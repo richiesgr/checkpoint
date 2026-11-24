@@ -1,0 +1,66 @@
+# Sample configuration for the acceptance scenario (e1 to e5 in sample/events.jsonl).
+#
+# Tenant A: 3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90
+#   forwards sales/purchase and security/alert to dest-a-file. No identity rule (default deny).
+# Tenant B: 9d4e1a72-3c5b-4f8e-a1d2-6b7c8e9f0a13
+#   forwards sales/purchase to dest-b-file.
+#
+# File destinations are written to <output_root>/<tenant_id>/<destination_id>/ ,
+# derived from the owning tenant and the destination id only. So the two tenants
+# always get separate directories.
+
+kafka:
+  bootstrap_servers: "localhost:9092"
+
+# Run output root (relative to the working directory). Every file destination
+# path must stay inside it.
+output_root: "output"
+
+destinations:
+  - id: dest-a-file
+    tenant_id: "3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90"
+    kind: file
+    format: jsonl
+
+  - id: dest-b-file
+    tenant_id: "9d4e1a72-3c5b-4f8e-a1d2-6b7c8e9f0a13"
+    kind: file
+    format: jsonl
+
+  # Intended production target for tenant B. HTTP delivery is designed, not
+  # built, so this stays commented out. The secret is an env-var reference,
+  # never a literal value.
+  # - id: dest-b-http
+  #   tenant_id: "9d4e1a72-3c5b-4f8e-a1d2-6b7c8e9f0a13"
+  #   kind: http
+  #   format: json
+  #   settings:
+  #     url: "https://siem.tenant-b.example.com/events"
+  #     auth_token_env: "TENANT_B_HTTP_TOKEN"
+
+rules:
+  # Tenant A, sales/purchase: forward without internal_note.
+  - tenant_id: "3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90"
+    product: sales
+    schema: purchase
+    enabled: true
+    include_fields: [order_id, amount]
+    destinations: [dest-a-file]
+
+  # Tenant A, security/alert: all payload fields plus a constant and a calculated field.
+  - tenant_id: "3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90"
+    product: security
+    schema: alert
+    enabled: true
+    constant_fields:
+      region: "eu"
+    calculated_fields:
+      risk_score: "risk * 2"
+    destinations: [dest-a-file]
+
+  # Tenant B, sales/purchase: forward everything in data.
+  - tenant_id: "9d4e1a72-3c5b-4f8e-a1d2-6b7c8e9f0a13"
+    product: sales
+    schema: purchase
+    enabled: true
+    destinations: [dest-b-file]

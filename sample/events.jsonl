@@ -1,0 +1,5 @@
+{"event_id":"e1","product":"sales","schema":"purchase","tenant_id":"3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90","data":{"order_id":"o1","amount":10,"internal_note":"private"}}
+{"event_id":"e2","product":"security","schema":"alert","tenant_id":"3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90","data":{"alert_id":"a1","risk":7}}
+{"event_id":"e3","product":"sales","schema":"purchase","tenant_id":"9d4e1a72-3c5b-4f8e-a1d2-6b7c8e9f0a13","data":{"order_id":"o2","amount":5}}
+{"event_id":"e4","product":"sales","schema":"purchase","tenant_id":"","data":{"order_id":"o3","amount":3}}
+{"event_id":"e5","product":"identity","schema":"login","tenant_id":"3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90","data":{"user":"u1","result":"success"}}
