@@ -1,6 +1,8 @@
 """Processing-stage pipeline: parse, route, shape, guard, publish-ready (Spark Column logic only)."""
 from __future__ import annotations
 
+import json
+
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
@@ -163,3 +165,85 @@ def route_events(
         )
         audit = audit.unionByName(invalid_tenant)
     return routed, audit
+
+# Columns of the shaped DataFrame returned by shape_events.
+SHAPED_COLUMNS = (
+    "event_id",
+    "product",
+    "schema",
+    "tenant_id",
+    "source_file",
+    "rule_index",
+    "destination_id",
+    "destination_kind",
+    "destination_format",
+    "payload",
+)
+
+
+def _json_key(name: str) -> str:
+    return json.dumps(name, ensure_ascii=False)
+
+
+def _variant_path(name: str) -> str:
+    escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+    return f"$['{escaped}']"
+
+
+def _constants_json(constants: dict | None) -> str:
+    """Constant fields as the inside of a JSON object, e.g. ``"region":"eu","n":1`` (config-only)."""
+    if not constants:
+        return ""
+    return ",".join(f"{_json_key(k)}:{json.dumps(v, ensure_ascii=False)}" for k, v in constants.items())
+
+
+def _payload_text(rule, data_variant: Column, data_text: Column) -> Column:
+    consts = _constants_json(rule.constant_fields)
+    if rule.include_fields is not None:
+        parts = []
+        for name in rule.include_fields:
+            value = F.try_variant_get(data_variant, _variant_path(name), "variant")
+            # SQL NULL = field absent (omitted); a JSON null is a variant null and is kept.
+            parts.append(F.when(value.isNotNull(), F.concat(F.lit(_json_key(name) + ":"), F.to_json(value))))
+        if consts:
+            parts.append(F.lit(consts))
+        return F.concat(F.lit("{"), F.concat_ws(",", *parts), F.lit("}"))
+    if not consts:
+        return data_text
+    inner = F.substring(data_text, 2, F.length(data_text) - 2)  # strip the outer braces
+    return F.concat(
+        F.lit("{"),
+        F.when(F.length(inner) > 0, F.concat(inner, F.lit(","))).otherwise(F.lit("")),
+        F.lit(consts),
+        F.lit("}"),
+    )
+
+
+def shape_events(routed_df: DataFrame, config) -> DataFrame:
+    """Build the Delivery_Message ``payload`` (variant) for each routed row with Column ops only.
+
+    Per rule (looked up by ``rule_index``, same numbering as ``build_rules_df``): the listed
+    top-level fields of ``data`` that are present (absent ones omitted) or all fields when the
+    rule has no include list, plus the rule's constant fields (string, number or boolean literals).
+    Constants are the only added columns. Envelope fields ``event_id``, ``product``, ``schema`` and
+    ``tenant_id`` are kept. The ``data`` column is dropped. The loop below is over configured
+    rules, never over events.
+
+    Note: with no include list, a constant whose name equals a top-level ``data`` field yields a
+    duplicate key in the payload text (config validation only checks include/constant clashes).
+    """
+    data_variant = F.parse_json(F.col("data"))
+    data_text = F.to_json(data_variant)
+    payload_text = None
+    for index, rule in reversed(list(enumerate(config.rules))):
+        branch = _payload_text(rule, data_variant, data_text)
+        payload_text = (
+            F.when(F.col("rule_index") == F.lit(index), branch)
+            if payload_text is None
+            else F.when(F.col("rule_index") == F.lit(index), branch).otherwise(payload_text)
+        )
+    if payload_text is None:
+        payload_text = data_text
+    return routed_df.select(
+        *[c for c in SHAPED_COLUMNS if c != "payload"], F.parse_json(payload_text).alias("payload")
+    )
