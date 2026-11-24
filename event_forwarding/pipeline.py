@@ -210,7 +210,12 @@ def _payload_text(rule, data_variant: Column, data_text: Column) -> Column:
         return F.concat(F.lit("{"), F.concat_ws(",", *parts), F.lit("}"))
     if not consts:
         return data_text
-    inner = F.substring(data_text, 2, F.length(data_text) - 2)  # strip the outer braces
+    # Constants override same-named data fields: drop those keys from data before appending constants.
+    names = list(rule.constant_fields)
+    as_map = F.from_json(data_text, "map<string,variant>")
+    kept = F.map_filter(as_map, lambda k, _v: ~k.isin(*names))
+    kept_text = F.to_json(kept)
+    inner = F.substring(kept_text, 2, F.length(kept_text) - 2)  # strip the outer braces
     return F.concat(
         F.lit("{"),
         F.when(F.length(inner) > 0, F.concat(inner, F.lit(","))).otherwise(F.lit("")),
@@ -229,8 +234,8 @@ def shape_events(routed_df: DataFrame, config) -> DataFrame:
     ``tenant_id`` are kept. The ``data`` column is dropped. The loop below is over configured
     rules, never over events.
 
-    Note: with no include list, a constant whose name equals a top-level ``data`` field yields a
-    duplicate key in the payload text (config validation only checks include/constant clashes).
+    With no include list, a constant whose name equals a top-level ``data`` field overrides it, so
+    the payload never has duplicate keys (config validation only checks include/constant clashes).
     """
     data_variant = F.parse_json(F.col("data"))
     data_text = F.to_json(data_variant)
@@ -247,3 +252,28 @@ def shape_events(routed_df: DataFrame, config) -> DataFrame:
     return routed_df.select(
         *[c for c in SHAPED_COLUMNS if c != "payload"], F.parse_json(payload_text).alias("payload")
     )
+
+
+def build_publish_ready(text_df: DataFrame, config) -> tuple[DataFrame, DataFrame, DataFrame]:
+    """Chain parse, route, shape, Isolation_Guard and publish columns (pure DataFrame logic).
+
+    Returns ``(publish_ready_df, rejected_df, audit_df)``. ``publish_ready_df`` has string columns
+    ``topic, key, value``. ``rejected_df`` has REJECTED_COLUMNS. ``audit_df`` holds the processing
+    audit rows (``no_matching_rule``, ``destination_kind_not_built``, ``invalid_tenant_id``,
+    ``isolation_violation``) with no payload. Used by both tests and ``foreachBatch``.
+    """
+    from event_forwarding.config_model import build_destination_owner_df, build_rules_df
+    from event_forwarding.isolation_guard import apply_isolation_guard
+    from event_forwarding.kafka_publish import add_publish_columns
+
+    spark = text_df.sparkSession
+    rules_df = build_rules_df(spark, config)
+    owner_df = build_destination_owner_df(spark, config)
+
+    valid, rejected = parse_events(text_df)
+    routed, route_audit = route_events(valid, rules_df, rejected)
+    shaped = shape_events(routed, config)
+    guarded, violations = apply_isolation_guard(shaped, rules_df, owner_df)
+    publish_ready = add_publish_columns(guarded)
+    audit = route_audit.unionByName(violations)
+    return publish_ready, rejected, audit
