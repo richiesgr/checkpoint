@@ -47,15 +47,13 @@ rules:
     include_fields: [order_id, amount]
     destinations: [dest-a-file]
 
-  # Tenant A, security/alert: all payload fields plus a constant and a calculated field.
+  # Tenant A, security/alert: all payload fields plus a constant field.
   - tenant_id: "3f2b8c1e-7a4d-4e9b-9c1a-2d5e6f7a8b90"
     product: security
     schema: alert
     enabled: true
     constant_fields:
       region: "eu"
-    calculated_fields:
-      risk_score: "risk * 2"
     destinations: [dest-a-file]
 
   # Tenant B, sales/purchase: forward everything in data.

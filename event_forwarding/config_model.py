@@ -20,7 +20,6 @@ from typing import Any, Mapping
 
 import yaml
 
-from event_forwarding.expr_parser import ExpressionError, parse_expression
 
 SUPPORTED_KINDS = ("file", "http", "syslog")
 SUPPORTED_FORMATS = {
@@ -38,13 +37,12 @@ _SECRET_WORDS = ("token", "secret", "password", "passwd", "authorization", "auth
 
 MAX_INCLUDE_FIELDS = 200
 MAX_CONSTANT_FIELDS = 100
-MAX_CALCULATED_FIELDS = 100
 MAX_DESTINATIONS_PER_RULE = 20
 
 _TOP_KEYS = {"kafka", "output_root", "audit_root", "rejected_root", "destinations", "rules"}
 _RULE_KEYS = {
     "tenant_id", "product", "schema", "enabled",
-    "include_fields", "constant_fields", "calculated_fields", "destinations",
+    "include_fields", "constant_fields", "destinations",
 }
 _DEST_KEYS = {"id", "tenant_id", "kind", "format", "settings"}
 _KAFKA_KEYS = {"bootstrap_servers"}
@@ -87,7 +85,6 @@ class Rule:
     enabled: bool = True
     include_fields: tuple | None = None
     constant_fields: dict | None = None
-    calculated_fields: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -274,7 +271,8 @@ def _parse_destinations(
 
 
 def _scalar_ok(value: Any) -> bool:
-    return value is None or isinstance(value, (str, int, float, bool))
+    # bool is a subclass of int; both are allowed JSON scalars. None, lists and maps are not.
+    return isinstance(value, (str, int, float, bool))
 
 
 def _parse_rules(c: _Collector, raw: Any, destinations: list[Destination], dest_ids: set[str]) -> list[Rule]:
@@ -289,8 +287,11 @@ def _parse_rules(c: _Collector, raw: Any, destinations: list[Destination], dest_
             c.add(label, "must be a mapping")
             continue
         label = f"rule #{index} (tenant_id={item.get('tenant_id')!r}, product={item.get('product')!r}, schema={item.get('schema')!r})"
-        _check_unknown(c, label, item, _RULE_KEYS)
         ok = True
+        if "calculated_fields" in item:
+            c.add(label, "calculated fields are not supported; use 'constant_fields' for fixed values")
+            ok = False
+        _check_unknown(c, label, {k: v for k, v in item.items() if k != "calculated_fields"}, _RULE_KEYS)
         tenant = normalize_tenant_id(item.get("tenant_id"))
         if tenant is None:
             c.add(label, f"tenant_id {item.get('tenant_id')!r} is not a valid UUID")
@@ -327,34 +328,14 @@ def _parse_rules(c: _Collector, raw: Any, destinations: list[Destination], dest_
                 c.add(label, f"'constant_fields' must be a map of 1 to {MAX_CONSTANT_FIELDS} fields")
                 ok = False
             elif not all(_scalar_ok(v) for v in constants.values()):
-                c.add(label, "'constant_fields' values must be strings, numbers, booleans or null")
+                c.add(label, "'constant_fields' values must be strings, numbers or booleans")
                 ok = False
             else:
                 names.extend(constants)
                 constants = dict(constants)
-        calculated = item.get("calculated_fields")
-        if calculated is not None:
-            if (
-                not isinstance(calculated, Mapping)
-                or not 1 <= len(calculated) <= MAX_CALCULATED_FIELDS
-                or not all(isinstance(k, str) and k for k in calculated)
-            ):
-                c.add(label, f"'calculated_fields' must be a map of 1 to {MAX_CALCULATED_FIELDS} fields")
-                ok = False
-            else:
-                good = True
-                for fname, expr in calculated.items():
-                    try:
-                        parse_expression(expr)
-                    except ExpressionError as exc:
-                        c.add(label, f"calculated field {fname!r} has an invalid expression: {exc}")
-                        good = ok = False
-                if good:
-                    names.extend(calculated)
-                    calculated = dict(calculated)
         dupes = sorted({n for n in names if names.count(n) > 1})
         if dupes:
-            c.add(label, f"duplicate field name(s) across include/constant/calculated fields: {dupes}")
+            c.add(label, f"duplicate field name(s) across include/constant fields: {dupes}")
             ok = False
 
         refs = item.get("destinations")
@@ -384,7 +365,6 @@ def _parse_rules(c: _Collector, raw: Any, destinations: list[Destination], dest_
                     enabled=enabled,
                     include_fields=include if isinstance(include, tuple) else None,
                     constant_fields=constants if isinstance(constants, dict) else None,
-                    calculated_fields=calculated if isinstance(calculated, dict) else None,
                 )
             )
     return result
@@ -465,8 +445,6 @@ def config_to_dict(config: Config) -> dict:
             entry["include_fields"] = list(r.include_fields)
         if r.constant_fields is not None:
             entry["constant_fields"] = dict(r.constant_fields)
-        if r.calculated_fields is not None:
-            entry["calculated_fields"] = dict(r.calculated_fields)
         rules.append(entry)
     return {
         "kafka": {"bootstrap_servers": config.kafka.bootstrap_servers},

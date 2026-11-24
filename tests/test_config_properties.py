@@ -168,3 +168,28 @@ def test_valid_uuid_forms_are_accepted_and_normalized(tenant, upper):
     cfg["rules"][0]["tenant_id"] = tenant
     parsed = parse_config(cfg, env=GOOD_ENV)
     assert parsed.destinations[0].tenant_id == str(uuid.UUID(tenant))
+
+@pytest.mark.parametrize("value", ["eu", "", 0, 7, -3, 1.5, True, False])
+def test_scalar_constants_load_unchanged(value):
+    cfg = base_config()
+    cfg["rules"][0]["constant_fields"] = {"k": value}
+    parsed = parse_config(cfg, env=GOOD_ENV)
+    loaded = parsed.rules[0].constant_fields["k"]
+    assert loaded == value and type(loaded) is type(value)
+
+
+def test_calculated_field_rejected_naming_the_rule():
+    cfg = base_config()
+    cfg["rules"][0]["calculated_fields"] = {"risk_score": "risk * 2"}
+    with pytest.raises(ConfigError) as info:
+        parse_config(cfg, env=GOOD_ENV)
+    assert info.value.category == "invalid"
+    assert any("rule #0" in e and "calculated fields" in e for e in info.value.errors)
+
+
+def test_non_scalar_constant_rejected_at_load():
+    cfg = base_config()
+    cfg["rules"][0]["constant_fields"] = {"tags": ["a", "b"]}
+    with pytest.raises(ConfigError) as info:
+        parse_config(cfg, env=GOOD_ENV)
+    assert any("rule #0" in e and "constant_fields" in e for e in info.value.errors)
