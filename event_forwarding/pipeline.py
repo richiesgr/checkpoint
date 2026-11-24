@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from event_forwarding.envelope_schema import (
     ENVELOPE_FIELDS,
@@ -277,3 +284,157 @@ def build_publish_ready(text_df: DataFrame, config) -> tuple[DataFrame, DataFram
     publish_ready = add_publish_columns(guarded)
     audit = route_audit.unionByName(violations)
     return publish_ready, rejected, audit
+
+
+# ---------------------------------------------------------------- streaming job
+@dataclass(frozen=True)
+class ProcessingResult:
+    """Outcome of ``run_processing`` (counters are driver-side numbers, never event rows)."""
+
+    isolation_violations: int
+    unreadable_files: tuple[str, ...]
+    batches: int
+
+    @property
+    def exit_code(self) -> int:
+        return 1 if (self.isolation_violations or self.unreadable_files) else 0
+
+
+LANDING_GLOB = "*.jsonl"
+SUMMARY_PARTS_DIR = "run_summary_batches"
+
+
+def kafka_batch_sink(bootstrap_servers: str) -> Callable[[DataFrame], None]:
+    """Default ``batch_sink``: one Spark Kafka sink write of the ``topic``, ``key`` and ``value`` columns.
+
+    The Kafka sink can republish after a retry, so delivery is at-least-once.
+    """
+
+    def publish(publish_df: DataFrame) -> None:
+        (
+            publish_df.select("topic", "key", "value")
+            .write.format("kafka")
+            .option("kafka.bootstrap.servers", bootstrap_servers)
+            .save()
+        )
+
+    return publish
+
+
+def find_unreadable_files(landing_zone: str | Path) -> list[str]:
+    """Names of top-level ``*.jsonl`` files that cannot be opened (directory metadata only)."""
+    bad: list[str] = []
+    with os.scandir(landing_zone) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".jsonl") or not entry.is_file():
+                continue
+            try:
+                with open(entry.path, "rb"):
+                    pass
+            except OSError:
+                bad.append(entry.path)
+    return sorted(bad)
+
+
+def _summary_schema() -> StructType:
+    from event_forwarding.summary_spark import COUNTERS
+
+    return StructType(
+        [StructField(n, StringType()) for n in ("scope", "tenant_id", "destination_id")]
+        + [StructField(n, LongType()) for n in COUNTERS]
+    )
+
+
+def _aggregate_summary_parts(spark, parts_dir: str) -> DataFrame:
+    """Sum the per-batch Run_Summary parts of this run with Spark (zero counters when none)."""
+    from event_forwarding.summary_spark import COUNTERS, SCOPE_TOTAL, SUMMARY_COLUMNS
+
+    parts = spark.read.schema(_summary_schema()).json(parts_dir)
+    sums = [F.coalesce(F.sum(F.col(c)), F.lit(0)).cast("long").alias(c) for c in COUNTERS]
+    total = (
+        parts.where(F.col("scope") == F.lit(SCOPE_TOTAL))
+        .agg(*sums)
+        .select(
+            F.lit(SCOPE_TOTAL).alias("scope"),
+            F.lit(None).cast("string").alias("tenant_id"),
+            F.lit(None).cast("string").alias("destination_id"),
+            *COUNTERS,
+        )
+    )
+    per_key = (
+        parts.where(F.col("scope") != F.lit(SCOPE_TOTAL))
+        .groupBy("scope", "tenant_id", "destination_id")
+        .agg(*sums)
+    )
+    return total.unionByName(per_key).select(*SUMMARY_COLUMNS)
+
+
+def run_processing(
+    spark,
+    config,
+    landing_zone: str | Path,
+    checkpoint: str | Path,
+    batch_sink: Callable[[DataFrame], None] | None = None,
+) -> ProcessingResult:
+    """Run the processing stream to drain (``availableNow``) and write all outputs with Spark.
+
+    Reads ``<landing_zone>/*.jsonl`` as text (no recursion) with ``checkpoint``. Each micro-batch
+    runs ``build_publish_ready``, hands the ``topic, key, value`` DataFrame to ``batch_sink``
+    (default: the Kafka sink), then writes the Rejected_Output, the processing audit and a
+    per-batch Run_Summary part. After the drain the parts are summed with Spark into the final
+    Run_Summary. The caller exits non-zero when the result has an isolation violation or an
+    unreadable file.
+    """
+    from event_forwarding.audit_spark import write_processing_audit
+    from event_forwarding.isolation_guard import ISOLATION_VIOLATION
+    from event_forwarding.summary_spark import build_run_summary, write_run_summary
+
+    sink = batch_sink if batch_sink is not None else kafka_batch_sink(config.kafka.bootstrap_servers)
+    landing = Path(landing_zone).resolve()
+
+    unreadable = find_unreadable_files(landing)
+    for name in unreadable:
+        print(f"error: cannot read landing-zone file {name}", file=sys.stderr)
+    # Unreadable files are skipped by Spark so the remaining files are still processed.
+    spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
+
+    run_id = uuid.uuid4().hex
+    parts_dir = (Path(config.audit_root) / SUMMARY_PARTS_DIR / run_id).resolve()
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    state = {"violations": 0, "batches": 0}
+
+    def process_batch(batch_df: DataFrame, batch_id: int) -> None:
+        batch_df.persist()
+        try:
+            publish_ready, rejected, audit = build_publish_ready(batch_df, config)
+            sink(publish_ready)
+            rejected.write.mode("append").option("ignoreNullFields", "false").json(
+                str(Path(config.rejected_root))
+            )
+            write_processing_audit(audit, config.audit_root)
+            valid, rejected_again = parse_events(batch_df)
+            read_df = valid.select("tenant_id").unionByName(rejected_again.select("tenant_id"))
+            dropped = audit.where(F.col("decision") == F.lit(DECISION_DROPPED))
+            summary = build_run_summary(read_df, rejected, dropped, publish_ready)
+            summary.write.mode("append").option("ignoreNullFields", "false").json(str(parts_dir))
+            state["violations"] += audit.where(F.col("reason") == F.lit(ISOLATION_VIOLATION)).count()
+            state["batches"] += 1
+        finally:
+            batch_df.unpersist()
+
+    stream = (
+        spark.readStream.format("text")
+        .load((landing / LANDING_GLOB).as_posix())
+        .select(F.col("value"), F.col("_metadata.file_path").alias("source_file"))
+    )
+    query = (
+        stream.writeStream.foreachBatch(process_batch)
+        .option("checkpointLocation", str(Path(checkpoint).resolve()))
+        .trigger(availableNow=True)
+        .start()
+    )
+    query.awaitTermination()
+
+    final = _aggregate_summary_parts(spark, str(parts_dir))
+    write_run_summary(final, config.audit_root)
+    return ProcessingResult(state["violations"], tuple(unreadable), state["batches"])

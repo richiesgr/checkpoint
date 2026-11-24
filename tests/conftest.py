@@ -44,7 +44,10 @@ def spark(tmp_path_factory):
     warehouse = tmp_path_factory.mktemp("spark-warehouse")
     session = build_spark(
         app_name="event-forwarding-tests",
-        master="local[*]",
+        # Two cores and one default partition: tiny test DataFrames would otherwise get 16
+        # partitions, and on Windows each task over Python-created data starts a new Python worker.
+        master="local[2]",
+        default_parallelism=1,
         warehouse_dir=str(warehouse),
         shuffle_partitions=2,
         # The connector is only resolved (network) for kafka-marked tests.

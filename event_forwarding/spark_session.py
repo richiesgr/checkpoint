@@ -27,6 +27,7 @@ def build_spark(
     warehouse_dir: str | None = None,
     shuffle_partitions: int = 4,
     with_kafka: bool = True,
+    default_parallelism: int | None = None,
 ) -> SparkSession:
     pin_python_env()
     builder = (
@@ -38,6 +39,8 @@ def build_spark(
     )
     if warehouse_dir:
         builder = builder.config("spark.sql.warehouse.dir", warehouse_dir)
+    if default_parallelism is not None:
+        builder = builder.config("spark.default.parallelism", str(default_parallelism))
     if with_kafka:
         builder = builder.config("spark.jars.packages", kafka_package())
     return builder.getOrCreate()

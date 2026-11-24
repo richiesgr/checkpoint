@@ -467,6 +467,26 @@ def serialize_config(config: Config, fmt: str = "yaml") -> str:
 
 
 # ---------------------------------------------------------------- small Spark DataFrames
+def _literal_df(spark, rows, schema):
+    """DataFrame of ``rows`` built from Spark literals in one partition.
+
+    ``spark.createDataFrame(list)`` goes through a Python RDD, so every task of every scan starts a
+    Python worker. On Windows there is no reusable worker daemon, which costs about 0.5 s per task.
+    Literals keep these small config tables inside the JVM. Config values only, never Event data.
+    """
+    from pyspark.sql import functions as F
+
+    one_row = spark.range(0, 1, 1, 1)
+    if not rows:
+        return one_row.select(
+            *[F.lit(None).cast(f.dataType).alias(f.name) for f in schema.fields]
+        ).where(F.lit(False))
+    structs = [
+        F.struct(*[F.lit(v).cast(f.dataType).alias(f.name) for v, f in zip(row, schema.fields)])
+        for row in rows
+    ]
+    return one_row.select(F.inline(F.array(*structs)))
+
 def build_rules_df(spark, config: Config):
     """Small broadcastable DataFrame: one row per (rule, destination).
 
@@ -492,7 +512,7 @@ def build_rules_df(spark, config: Config):
         for dest_id in rule.destinations:
             dest = config.destination(dest_id)
             rows.append((index, rule.tenant_id, rule.product, rule.schema, rule.enabled, dest_id, dest.kind, dest.format))
-    return spark.createDataFrame(rows, schema)
+    return _literal_df(spark, rows, schema)
 
 
 def build_destination_owner_df(spark, config: Config):
@@ -512,4 +532,4 @@ def build_destination_owner_df(spark, config: Config):
     for d in config.destinations:
         path = str(destination_output_dir(config, d)) if d.kind == "file" else None
         rows.append((d.id, d.tenant_id, path, d.kind, d.format))
-    return spark.createDataFrame(rows, schema)
+    return _literal_df(spark, rows, schema)

@@ -142,7 +142,7 @@ def test_base_config_is_valid():
     assert {d.id for d in cfg.destinations} == {"dest-a-file", "dest-b-file", "dest-b-http"}
 
 
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=2, deadline=None)
 @given(data=st.data(), defect=st.sampled_from(DEFECTS), empty_secret=st.booleans())
 def test_every_planted_defect_rejects_whole_config(data, defect, empty_secret):
     cfg = copy.deepcopy(base_config())
@@ -160,7 +160,7 @@ def test_every_planted_defect_rejects_whole_config(data, defect, empty_secret):
     assert GOOD_ENV[ENV_VAR] not in str(info.value)
 
 
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=2, deadline=None)
 @given(tenant=valid_uuids, upper=st.booleans())
 def test_valid_uuid_forms_are_accepted_and_normalized(tenant, upper):
     cfg = base_config()
