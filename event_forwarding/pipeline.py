@@ -88,3 +88,78 @@ def parse_events(text_df: DataFrame) -> tuple[DataFrame, DataFrame]:
         "source_file",
     )
     return valid, rejected
+
+
+# Columns of the routed DataFrame returned by route_events.
+ROUTED_COLUMNS = (
+    "event_id",
+    "product",
+    "schema",
+    "tenant_id",
+    "data",
+    "source_file",
+    "rule_index",
+    "destination_id",
+    "destination_kind",
+    "destination_format",
+)
+
+DECISION_DROPPED = "dropped"
+REASON_NO_MATCHING_RULE = "no_matching_rule"
+REASON_DESTINATION_KIND_NOT_BUILT = "destination_kind_not_built"
+BUILT_DESTINATION_KIND = "file"
+
+
+def route_events(
+    valid_df: DataFrame, rules_df: DataFrame, rejected_df: DataFrame | None = None
+) -> tuple[DataFrame, DataFrame]:
+    """Route valid events to the enabled rules that match them exactly (Default_Deny).
+
+    A broadcast join on ``(tenant_id, product, schema)`` with plain string equality (case
+    sensitive, no trimming, no wildcards) against the rules with ``enabled = true``. One routed
+    row per matching (rule, destination), so an event matched by N rules fans out to N rows.
+    Events whose matching destination is not a built kind (``http``/``syslog``) are dropped here.
+
+    Returns ``(routed_df, audit_df)``. ``routed_df`` has ROUTED_COLUMNS (kind ``file`` only).
+    ``audit_df`` has the processing audit columns (no payload) with decision ``dropped`` and reason
+    ``no_matching_rule``, ``destination_kind_not_built`` or, when ``rejected_df`` (from
+    ``parse_events``) is given, ``invalid_tenant_id`` for the rejected rows with that reason.
+    """
+    from event_forwarding.audit_spark import build_audit_rows
+
+    active = F.broadcast(
+        rules_df.where(F.col("enabled")).select(
+            F.col("rule_index"),
+            F.col("tenant_id").alias("_r_tenant_id"),
+            F.col("product").alias("_r_product"),
+            F.col("schema").alias("_r_schema"),
+            F.col("destination_id"),
+            F.col("destination_kind"),
+            F.col("destination_format"),
+        )
+    )
+    on = (
+        (valid_df["tenant_id"] == F.col("_r_tenant_id"))
+        & (valid_df["product"] == F.col("_r_product"))
+        & (valid_df["schema"] == F.col("_r_schema"))
+    )
+
+    matched = valid_df.join(active, on, "inner")
+    is_built = F.col("destination_kind") == F.lit(BUILT_DESTINATION_KIND)
+    routed = matched.where(is_built).select(*ROUTED_COLUMNS)
+
+    not_built = build_audit_rows(
+        matched.where(~is_built), DECISION_DROPPED, REASON_DESTINATION_KIND_NOT_BUILT
+    )
+    unmatched = build_audit_rows(
+        valid_df.join(active, on, "left_anti"), DECISION_DROPPED, REASON_NO_MATCHING_RULE
+    )
+    audit = unmatched.unionByName(not_built)
+    if rejected_df is not None:
+        invalid_tenant = build_audit_rows(
+            rejected_df.where(F.col("reason") == F.lit(REASON_INVALID_TENANT_ID)),
+            DECISION_DROPPED,
+            REASON_INVALID_TENANT_ID,
+        )
+        audit = audit.unionByName(invalid_tenant)
+    return routed, audit
