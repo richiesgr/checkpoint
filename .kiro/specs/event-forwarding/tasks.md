@@ -360,8 +360,9 @@ Implementation constraints that apply to every task:
     - _Requirements: 4.8, 13.1, 13.2, 13.3, 13.13_
 
 - [ ] 12. Kafka-marked tests (cut first if time runs short)
-  - [ ] 12.1 Write the Kafka acceptance test
-    - Marked `kafka`. Run the processing job and then the File_Sink_Worker against the docker-compose broker using `sample/`, with unique topic and checkpoint names per run.
+  - [x] 12.1 Write the Kafka acceptance test
+    - Marked `kafka`. Run the processing job and then the File_Sink_Worker against the docker-compose broker using `sample/`.
+    - Use the fixed shared topics `delivery.file` and `delivery.file.dlq` (one topic per destination kind, never per tenant or per run). Use unique checkpoint and output directories per run. Because the topics keep messages from earlier runs, assert only on the messages of this run (for example, offsets recorded at test start, or this run's `event_id`s).
     - Assert criteria 3 to 9 of Requirement 10: consumed topic and key (three messages, none for e4 and e5), files written by the worker, `internal_note` omitted, `region == "eu"` and the unchanged `risk` value on e2, no cross-tenant files, and an empty DLQ for e4 and e5.
     - File: `tests/test_acceptance_kafka.py`.
     - _Requirements: 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10, 12.3, 12.4_
@@ -376,7 +377,38 @@ Implementation constraints that apply to every task:
     - File: `tests/test_sink_checkpoint_kafka.py`.
     - _Requirements: 12.19, 5.12, 15.12_
 
-- [ ] 13. Final checkpoint - Ensure all tests pass
+- [ ] 13. Landing-zone generator and end-to-end test
+  - [x] 13.1 Implement the landing-zone event generator
+    - A generator that writes JSON Lines files in the event envelope (`event_id`, `product`, `schema`, `tenant_id`, `data`) into a landing-zone directory, for the processing job to read.
+    - Every run gives its events unique `event_id`s, so a test can tell its events apart from messages left on the shared topics by earlier runs.
+    - Decided with the user:
+      - Base the data on the samples in `docs/event-forwarding-assignment.md` and keep it coherent with them.
+      - At most 10 unique tenants, each a UUID.
+      - `product` comes from a fixed set and `schema` from a fixed, predefined set per product, matching the assignment: `sales/purchase`, `security/alert`, `identity/login`.
+      - `data` is random but keeps the sample's fields for its schema (`purchase`: `order_id`, `amount`, `internal_note`; `alert`: `alert_id`, `risk`; `login`: `user`, `result`).
+      - The data follows a repeating, predictable pattern, so the expected result can be computed and checked at the end (for example, counts per tenant, product and schema, and field values derived from the event's sequence number).
+      - Bad data is mixed in, so the rejected output can be checked too: for example malformed JSON, an empty or non-UUID `tenant_id`, a missing envelope field, a non-object `data`.
+      - The generator also writes a matching config file (rules and destinations for the generated tenants), so the test can check that every rule is applied exactly. The mix covers tenants with rules, tenants without rules, products not forwarded, include lists and constant fields. `sample/config.yaml` is not changed.
+      - A fixed seed is used for the random parts.
+      - Everything for the end-to-end test lives in its own directory, `tests/end_to_end/` (settings, generator, Kafka helpers, test, start script, README). Each run writes its generated config, data, checkpoints and output to `%TEMP%\e2e-<run_id>` (or `E2E_RUN_ROOT`), outside the repository, because Spark staging paths under the repository exceed the Windows 260-character limit. Never committed.
+      - Rules of the generated config: T0-T3 `sales/purchase` (include `order_id`, `amount`) and `security/alert` (constant `region: "eu"`); T4-T5 `sales/purchase` all fields; T6 `sales/purchase` fan-out to two destinations; T7 a disabled rule; T8 no rule with a destination; T9 no rule and no destination; no tenant forwards `identity/login`.
+    - Counts per run (decided with the user): exactly 1,000 valid events that match at least one enabled rule (delivered), 150 valid events that match no enabled rule (not delivered: unforwarded product, tenant without rules, disabled rule), and 20 bad lines (rejected). Delivered file records can exceed 1,000 when a rule fans out to two destinations; the test computes the exact expected count from the generated config.
+    - The 1,170 lines are split across 5 landing-zone `.jsonl` files.
+    - Not Event_Path code: it produces input and never touches the processing or sink path.
+
+  - [x] 13.2 Write the end-to-end test
+    - Marked `kafka`. Flow: the generator writes files to a temp landing zone. The processing job (`run_processing`) reads them and publishes to `delivery.file`. The File_Sink_Worker reads `delivery.file`, applies `sink_transform` and writes each destination's files under the `output_root` from `config.yaml` (redirected to a temp directory for the test).
+    - Only the file destination kind is exercised. No `delivery.http` or `delivery.syslog` topics.
+    - Use the fixed shared topics, unique checkpoints and output directories per run, and assert only on this run's `event_id`s.
+    - Assert: every generated event that a rule forwards is written exactly once under its tenant's configured destination directory, with the configured shaping (include list, constant fields). No event reaches another tenant's directory. Events without an enabled rule, unconfigured tenants and invalid tenants produce no files. Nothing from this run reaches `delivery.file.dlq` unless planted.
+    - Check rejected lines too: each planted bad line appears in the Rejected_Output with its expected reason, and none reaches Kafka or a file.
+    - File: `tests/end_to_end/test_end_to_end_kafka.py`.
+    - Also check that no staging files (`.tmp`) are left in customer directories.
+    - Add `tests/end_to_end/run-end-to-end.ps1`, which starts the broker if needed, creates the topics with `scripts/create-topics.ps1`, and runs this test through the venv (`.\.venv\Scripts\python.exe -m pytest tests/end_to_end -m kafka`). `-GenerateOnly` only writes a run directory.
+    - The worker starts at the topic offsets recorded before the run (`run_worker(..., starting_offsets=...)`, default `earliest`), so it never reads earlier runs' messages.
+    - _Requirements: 3.1, 3.2, 4.1, 4.4, 5.1, 8.5, 8.9, 8.11, 15.3, 15.11_
+
+- [ ] 14. Final checkpoint - Ensure all tests pass
   - Run `pytest` (no Docker) and, if the broker is available, `pytest -m kafka`. Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
@@ -420,8 +452,9 @@ Implementation constraints that apply to every task:
     { "id": 20, "tasks": ["10"] },
     { "id": 21, "tasks": ["11.1"] },
     { "id": 22, "tasks": ["11.2", "11.3", "11.4"] },
-    { "id": 23, "tasks": ["11.5", "12.1", "12.2", "12.3"] },
-    { "id": 24, "tasks": ["13"] }
+    { "id": 23, "tasks": ["11.5", "12.1", "12.2", "12.3", "13.1"] },
+    { "id": 24, "tasks": ["13.2"] },
+    { "id": 25, "tasks": ["14"] }
   ]
 }
 ```

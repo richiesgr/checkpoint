@@ -60,7 +60,32 @@ Every command below calls `.\.venv\Scripts\python.exe` directly, so no activatio
 
 # Tests that need the local Kafka broker (start it first, see below)
 .\.venv\Scripts\python.exe -m pytest -m kafka
+
+# End-to-end run with generated data (10 tenants, 1,170 lines): starts the broker if needed
+.\tests\end_to_end\run-end-to-end.ps1
+
+# Only generate a run folder (config, landing files, expected counts); no broker, no Spark
+.\tests\end_to_end\run-end-to-end.ps1 -GenerateOnly
 ```
+
+The end-to-end test, its generator, config and start script are in `tests/end_to_end/` (see `tests/end_to_end/README.md`).
+
+Each run writes to its own folder in the system temp directory, `%TEMP%\e2e-<run_id>` (for example `C:\Users\<you>\AppData\Local\Temp\e2e-106c0332`). The run id is printed in the test log. Set `E2E_RUN_ROOT` to use another root.
+
+| Path in the run folder | Content |
+|---|---|
+| `landing\events-1.jsonl` .. `events-5.jsonl` | Landing zone: the generated input |
+| `out\<tenant_id>\<destination_id>\*.jsonl` | Delivered files, one folder per tenant and destination |
+| `rejected\` | Rejected lines with their reason |
+| `audit\` | Processing and delivery audit, `run_summary`, `worker_summary` |
+| `config.yaml`, `expected.json` | Generated config and the expected counts |
+
+```powershell
+explorer "$env:TEMP\e2e-<run_id>"                                    # open a run folder
+Get-ChildItem "$env:TEMP\e2e-<run_id>\out" -Recurse -File -Filter *.jsonl   # list the delivered files
+```
+
+Run folders are not deleted automatically. They contain paths close to the Windows 260-character limit, so delete one with `cmd /c rd /s /q "\\?\<full path>"` if `Remove-Item` fails.
 
 Run one pytest process at a time: each starts its own Spark JVM. Hypothesis tests use 2 examples each, because every example runs a Spark job. Kafka-marked tests skip with a message naming the broker when `localhost:9092` is unreachable (`KAFKA_TEST_HOST` and `KAFKA_TEST_PORT` override the address).
 
@@ -114,6 +139,8 @@ CLI arguments:
 Exit codes: 0 success; 1 isolation violation or failed DLQ publish or audit write during the run; 2 startup failure (config, landing zone, checkpoint clash, broker unreachable), before any event is read. Checkpoint, `output/`, `audit/` and `rejected/` directories are not committed.
 
 Running a job again with the same checkpoint processes only new input. Delete the checkpoint directory (and use a fresh topic) to start over.
+
+Logs: both jobs write progress lines to stderr (Python `logging`, `event_forwarding.*` loggers at INFO): start parameters, one start and one done line per micro-batch, and the run totals read from the written Run_Summary or Worker_Summary. They hold ids, paths and counters only, never payloads or secret values. Spark's own log level stays at its default for the CLIs and `ERROR` in the tests. `pytest.ini` turns on live logs (`log_cli`), so the same lines show while tests run.
 
 ## Configuration and shaping limit
 
