@@ -24,6 +24,7 @@ EVENT_PATH_MODULES = [
     "summary_worker.py",
     "cli_spark.py",
     "cli_file_sink_worker.py",
+    "log_util.py",
 ]
 ALLOW_LISTED = {"config_model.py"}
 

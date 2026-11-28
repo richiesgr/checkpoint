@@ -12,6 +12,9 @@ from pathlib import Path
 
 from event_forwarding.config_model import ConfigError, load_config
 from event_forwarding.kafka_util import BrokerUnreachableError, require_broker
+from event_forwarding.log_util import configure_logging, get_logger
+
+log = get_logger(__name__)
 
 EXIT_OK = 0
 EXIT_RUN_ERROR = 1
@@ -39,10 +42,12 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:  # argparse already wrote its usage error to stderr
         return int(exc.code) if isinstance(exc.code, int) and exc.code else EXIT_STARTUP_ERROR
 
+    configure_logging()
     try:
         config = load_config(args.config)
     except ConfigError as exc:
         return _fail(str(exc))
+    log.info("config loaded from %s", args.config)
 
     if not os.path.isdir(args.landing_zone):
         return _fail(f"landing zone is not an existing directory: {args.landing_zone}")

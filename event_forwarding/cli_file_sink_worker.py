@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from event_forwarding.config_model import ConfigError, load_config
 from event_forwarding.kafka_util import BrokerUnreachableError, require_broker
+from event_forwarding.log_util import configure_logging, get_logger, read_total_counters
+
+log = get_logger(__name__)
 
 EXIT_OK = 0
 EXIT_RUN_ERROR = 1
@@ -65,16 +69,31 @@ def _run_audit(spark, audit_root: str, since: datetime):
     )
 
 
-def run_worker(spark, config, checkpoint: str | Path):
-    """Drain ``delivery.file`` once and write the Worker_Summary. Returns the isolation violation count."""
+def run_worker(spark, config, checkpoint: str | Path, starting_offsets: str = "earliest"):
+    """Drain ``delivery.file`` once and write the Worker_Summary. Returns the isolation violation count.
+
+    ``starting_offsets`` is the Spark Kafka source option: ``earliest`` (default) or a JSON map of
+    per-partition offsets. Spark uses it only when the checkpoint is new; afterwards the
+    checkpoint decides. Tests pass explicit offsets to read only their own messages.
+    """
     from pyspark.sql import functions as F
 
     from event_forwarding.file_sink_write import process_micro_batch
     from event_forwarding.sink_transform import REASON_ISOLATION
-    from event_forwarding.summary_worker import build_worker_summary, write_worker_summary
+    from event_forwarding.summary_worker import build_worker_summary, worker_summary_path, write_worker_summary
 
     bootstrap = config.kafka.bootstrap_servers
     started = datetime.now(timezone.utc) - timedelta(seconds=1)
+    run_started = time.monotonic()
+    log.info(
+        "sink worker start: topic=%s starting_offsets=%s bootstrap=%s checkpoint=%s destinations=%d output_root=%s",
+        SOURCE_TOPIC,
+        starting_offsets,
+        bootstrap,
+        Path(checkpoint).resolve(),
+        len(config.destinations),
+        Path(config.output_root).resolve(),
+    )
 
     def handle(batch_df, batch_id: int) -> None:
         process_micro_batch(batch_df, batch_id, config)
@@ -83,7 +102,7 @@ def run_worker(spark, config, checkpoint: str | Path):
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", bootstrap)
         .option("subscribe", SOURCE_TOPIC)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", starting_offsets)
         .option("failOnDataLoss", "false")
         .load()
     )
@@ -98,7 +117,18 @@ def run_worker(spark, config, checkpoint: str | Path):
     audit = _run_audit(spark, config.audit_root, started).persist()
     try:
         write_worker_summary(build_worker_summary(audit), config.audit_root)
-        return audit.where(F.col("reason") == F.lit(REASON_ISOLATION)).count()
+        violations = audit.where(F.col("reason") == F.lit(REASON_ISOLATION)).count()
+        summary_dir = worker_summary_path(config.audit_root)
+        log.info(
+            "sink worker done in %.1fs: totals=%s isolation_violations=%d summary=%s",
+            time.monotonic() - run_started,
+            read_total_counters(summary_dir),
+            violations,
+            Path(summary_dir).resolve(),
+        )
+        if violations:
+            log.error("sink worker: %d isolation violation(s), see the delivery audit and %s", violations, "delivery.file.dlq")
+        return violations
     finally:
         audit.unpersist()
 
@@ -109,10 +139,12 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:  # argparse already wrote its usage error to stderr
         return int(exc.code) if isinstance(exc.code, int) and exc.code else EXIT_STARTUP_ERROR
 
+    configure_logging()
     try:
         config = load_config(args.config)
     except ConfigError as exc:
         return _fail(str(exc))
+    log.info("config loaded from %s", args.config)
 
     if args.processing_checkpoint and Path(args.processing_checkpoint).resolve() == Path(args.checkpoint).resolve():
         return _fail("the sink checkpoint must differ from the processing checkpoint")

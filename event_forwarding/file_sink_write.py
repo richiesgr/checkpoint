@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import uuid
 from functools import reduce
 from pathlib import Path
@@ -24,7 +25,10 @@ from pyspark.sql import functions as F
 from event_forwarding.audit_worker import delivered_audit_rows, write_delivery_audit
 from event_forwarding.audit_spark import build_audit_rows
 from event_forwarding.config_model import Config, build_destination_owner_df, destination_output_dir
+from event_forwarding.log_util import get_logger, remove_staging_dir
 from event_forwarding.sink_transform import DECISION_DEAD_LETTERED, sink_transform
+
+log = get_logger(__name__)
 
 DLQ_TOPIC = "delivery.file.dlq"
 REASON_WRITE_FAILED = "write_failed"
@@ -108,6 +112,10 @@ def process_micro_batch(
     if publish_dlq is None:
         publish_dlq = kafka_dlq_publisher(config.kafka.bootstrap_servers)
 
+    started = time.monotonic()
+    log.info("sink batch %d: start", batch_id)
+    written: list[str] = []
+    failed: list[str] = []
     spark = batch_df.sparkSession
     owners = build_destination_owner_df(spark, config)
     deliverable_df, sink_dlq_df, sink_audit_df = sink_transform(batch_df, owners)
@@ -122,10 +130,16 @@ def process_micro_batch(
                 continue
             dest_df = deliverable_df.filter(F.col("destination_id") == F.lit(dest.id))
             final_dir = destination_output_dir(config, dest)
-            tmp_root = final_dir / _TMP_DIR / f"{batch_id}-{uuid.uuid4().hex}"
+            # Short staging name: Spark's part and .crc files under it come close to the Windows path limit.
+            tmp_root = final_dir / _TMP_DIR / f"{batch_id}-{uuid.uuid4().hex[:8]}"
             try:
                 _write_destination(dest_df, final_dir, tmp_root)
-            except Exception:  # noqa: BLE001 - dead-letter this Destination, keep going
+            except Exception as write_exc:  # noqa: BLE001 - dead-letter this Destination, keep going
+                log.error(
+                    "sink batch %d: write failed for destination %s, its rows go to %s: %s",
+                    batch_id, dest.id, DLQ_TOPIC, write_exc,
+                )
+                failed.append(dest.id)
                 try:
                     shutil.rmtree(tmp_root, ignore_errors=True)
                 except OSError as exc:  # pragma: no cover - ignore_errors should prevent this
@@ -137,8 +151,9 @@ def process_micro_batch(
                     build_audit_rows(dest_df, DECISION_DEAD_LETTERED, REASON_WRITE_FAILED)
                 )
                 continue
-            shutil.rmtree(tmp_root, ignore_errors=True)
+            remove_staging_dir(tmp_root)
             delivered_parts.append(dest_df)
+            written.append(dest.id)
 
         if delivered_parts:
             delivered_df = reduce(DataFrame.unionByName, delivered_parts)
@@ -148,9 +163,14 @@ def process_micro_batch(
         try:
             publish_dlq(dlq_df)
         except Exception as exc:
+            log.error("sink batch %d: DLQ publish failed, the batch will be retried: %s", batch_id, exc)
             raise DlqPublishError(f"DLQ publish failed for batch {batch_id}: {exc}") from exc
 
         audit_df = reduce(DataFrame.unionByName, audit_parts)
         write_delivery_audit(audit_df, batch_df, config.audit_root)
+        log.info(
+            "sink batch %d: done in %.1fs, destinations written=%d failed=%s",
+            batch_id, time.monotonic() - started, len(written), failed or "none",
+        )
     finally:
         deliverable_df.unpersist()

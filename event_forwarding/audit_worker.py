@@ -11,7 +11,6 @@ it is never recorded as a decision.
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from pathlib import Path
 
@@ -19,6 +18,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from event_forwarding.audit_spark import AUDIT_FIELDS, build_audit_rows
+from event_forwarding.log_util import remove_staging_dir
 
 DELIVERY_AUDIT_DIR = "delivery"
 DECISION_DELIVERED = "delivered"
@@ -73,7 +73,8 @@ def write_delivery_audit(audit_rows_df: DataFrame, offsets_df: DataFrame, audit_
     supplies the file name. Raises ``AuditWriteError`` on any failure.
     """
     final_dir = Path(delivery_audit_path(audit_root))
-    tmp_dir = final_dir / _TMP_DIR / uuid.uuid4().hex
+    # Short staging name: Spark's part and .crc files under it come close to the Windows path limit.
+    tmp_dir = final_dir / _TMP_DIR / uuid.uuid4().hex[:8]
     try:
         final_dir.mkdir(parents=True, exist_ok=True)
         (
@@ -98,4 +99,4 @@ def write_delivery_audit(audit_rows_df: DataFrame, offsets_df: DataFrame, audit_
     except Exception as exc:  # noqa: BLE001 - surfaced as a typed error
         raise AuditWriteError(f"audit write failed under {final_dir}: {exc}") from exc
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        remove_staging_dir(tmp_dir)

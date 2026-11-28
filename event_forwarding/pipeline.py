@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,6 +21,9 @@ from event_forwarding.envelope_schema import (
     REASON_MISSING_ENVELOPE_FIELD,
     UUID_REGEX,
 )
+from event_forwarding.log_util import get_logger, read_total_counters
+
+log = get_logger(__name__)
 
 # Columns of the rejected DataFrame returned by parse_events.
 REJECTED_COLUMNS = ("line", "source_file", "reason", "event_id", "product", "schema", "tenant_id")
@@ -387,14 +390,23 @@ def run_processing(
     """
     from event_forwarding.audit_spark import write_processing_audit
     from event_forwarding.isolation_guard import ISOLATION_VIOLATION
-    from event_forwarding.summary_spark import build_run_summary, write_run_summary
+    from event_forwarding.summary_spark import build_run_summary, run_summary_path, write_run_summary
 
     sink = batch_sink if batch_sink is not None else kafka_batch_sink(config.kafka.bootstrap_servers)
     landing = Path(landing_zone).resolve()
+    run_started = time.monotonic()
+    log.info(
+        "processing start: landing_zone=%s checkpoint=%s rules=%d destinations=%d sink=%s",
+        landing,
+        Path(checkpoint).resolve(),
+        len(config.rules),
+        len(config.destinations),
+        "kafka " + config.kafka.bootstrap_servers if batch_sink is None else "custom",
+    )
 
     unreadable = find_unreadable_files(landing)
     for name in unreadable:
-        print(f"error: cannot read landing-zone file {name}", file=sys.stderr)
+        log.error("cannot read landing-zone file %s", name)
     # Unreadable files are skipped by Spark so the remaining files are still processed.
     spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
 
@@ -404,6 +416,8 @@ def run_processing(
     state = {"violations": 0, "batches": 0}
 
     def process_batch(batch_df: DataFrame, batch_id: int) -> None:
+        batch_started = time.monotonic()
+        log.info("processing batch %d: start", batch_id)
         batch_df.persist()
         try:
             publish_ready, rejected, audit = build_publish_ready(batch_df, config)
@@ -417,8 +431,12 @@ def run_processing(
             dropped = audit.where(F.col("decision") == F.lit(DECISION_DROPPED))
             summary = build_run_summary(read_df, rejected, dropped, publish_ready)
             summary.write.mode("append").option("ignoreNullFields", "false").json(str(parts_dir))
-            state["violations"] += audit.where(F.col("reason") == F.lit(ISOLATION_VIOLATION)).count()
+            violations = audit.where(F.col("reason") == F.lit(ISOLATION_VIOLATION)).count()
+            state["violations"] += violations
             state["batches"] += 1
+            if violations:
+                log.error("processing batch %d: %d isolation violation(s), see the processing audit", batch_id, violations)
+            log.info("processing batch %d: done in %.1fs", batch_id, time.monotonic() - batch_started)
         finally:
             batch_df.unpersist()
 
@@ -437,4 +455,14 @@ def run_processing(
 
     final = _aggregate_summary_parts(spark, str(parts_dir))
     write_run_summary(final, config.audit_root)
+    summary_dir = run_summary_path(config.audit_root)
+    log.info(
+        "processing done in %.1fs: batches=%d totals=%s isolation_violations=%d unreadable_files=%d summary=%s",
+        time.monotonic() - run_started,
+        state["batches"],
+        read_total_counters(summary_dir),
+        state["violations"],
+        len(unreadable),
+        Path(summary_dir).resolve(),
+    )
     return ProcessingResult(state["violations"], tuple(unreadable), state["batches"])
