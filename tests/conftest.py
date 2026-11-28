@@ -1,6 +1,7 @@
 """Shared pytest fixtures: local Spark session, Kafka broker probe, Kafka_Shaped_Rows builder."""
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import sys
@@ -33,6 +34,11 @@ kafka_shaped_schema = StructType(
 
 KAFKA_HOST = os.environ.get("KAFKA_TEST_HOST", "localhost")
 KAFKA_PORT = int(os.environ.get("KAFKA_TEST_PORT", "9092"))
+
+# The py4j bridge and the test-side kafka-python client log every call or connection at INFO,
+# which would flood the live log.
+logging.getLogger("py4j").setLevel(logging.WARNING)
+logging.getLogger("kafka").setLevel(logging.WARNING)
 
 # Make sure spawned Python workers use the venv interpreter.
 os.environ["PYSPARK_PYTHON"] = sys.executable
@@ -77,7 +83,12 @@ def kafka_spark(tmp_path_factory, kafka_broker):
     """Separate-from-`spark` session is not possible in one JVM, so Kafka tests run in their own session."""
     from pyspark.sql import SparkSession
 
-    SparkSession.builder.getOrCreate().stop()
+    # spark.jars.packages is applied only when the JVM starts. Do not start one here without the
+    # connector (getOrCreate() would). Stop an existing session only. A JVM already started by the
+    # `spark` fixture in the same process has no connector, so run kafka tests on their own.
+    active = SparkSession.getActiveSession()
+    if active is not None:
+        active.stop()
     warehouse = tmp_path_factory.mktemp("spark-warehouse-kafka")
     session = build_spark(
         app_name="event-forwarding-kafka-tests",
